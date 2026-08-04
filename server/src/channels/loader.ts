@@ -30,7 +30,34 @@ export interface LoadedChannel extends ChannelManifest {
   builtin: boolean;
   dir: string;
   /** Present only when the module loaded and exports a usable start(). */
-  start?: (ctx: unknown) => Promise<{ stop: () => Promise<void> | void }>;
+  start?: (ctx: unknown) => Promise<{
+    stop: () => Promise<void> | void;
+    /** Optional. A transport that can only answer, like a webhook, omits it. */
+    send?: (
+      target: string,
+      text: string,
+      /**
+       * Optional one-tap replies. Each is exactly the message that would be
+       * typed, so a channel that renders them as buttons and one that ignores
+       * them entirely behave identically — the text protocol stays the only
+       * protocol, and buttons are presentation over it.
+       */
+      options?: { label: string; reply: string }[]
+    ) => Promise<void> | void;
+    /**
+     * Optional. Render a question the way this platform renders questions —
+     * Telegram has buttons, Slack has blocks — and capture the answer.
+     *
+     * Returning null means "not something I can present", and the portal falls
+     * back to asking in plain text. That is the default, not a failure: it is
+     * how a channel with no such affordance behaves, and how any channel
+     * behaves for a question that does not fit buttons.
+     */
+    prompt?: (
+      target: string,
+      request: { id: string; method: string; question: string; options?: string[] }
+    ) => Promise<{ value?: unknown; cancelled?: boolean } | null>;
+  }>;
 }
 
 export interface BrokenChannel {

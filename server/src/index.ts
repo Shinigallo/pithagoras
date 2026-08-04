@@ -13,7 +13,7 @@ import {
   listSessions,
   updateSession,
 } from "./db.js";
-import { agentHome } from "./agent.js";
+import { agentHome, resolveChannelSession } from "./agent.js";
 import {
   agentFileStatus,
   runWizard,
@@ -27,7 +27,11 @@ import { extensionsRouter } from "./api/extensions.js";
 import { channelsRouter } from "./api/channels.js";
 import { routinesRouter } from "./api/routines.js";
 import { skillsRouter } from "./api/skills.js";
+
 import { filesRouter } from "./api/files.js";
+import { mcpRouter } from "./api/mcp.js";
+import { peopleRouter } from "./api/people.js";
+
 import { routineSupervisor } from "./routines/supervisor.js";
 import { channelSupervisor } from "./channels/supervisor.js";
 import { piSettingsPath } from "./pi-settings.js";
@@ -41,6 +45,8 @@ const WORKSPACE_ROOT = path.resolve(
   process.env.WORKSPACE_ROOT || process.env.WORKSPACE_ROOT || "/workspaces"
 );
 const PORT = Number(process.env.PORT || 4100);
+/** Persistent place for CLIs, kept on PATH so pi and its tools can reach them. */
+const BIN_DIR = path.resolve(process.env.BIN_DIR || "/data/bin");
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -180,6 +186,29 @@ app.get("/api/agent/sessions", (_req, res) => {
         : null,
     })),
   });
+});
+
+/**
+ * A new agent conversation started from the browser.
+ *
+ * Not a channel: the portal's own UI is a better client than any channel could
+ * be — it streams the transcript, shows tool calls and answers extension
+ * dialogs — so it talks to the agent directly rather than relaying text.
+ * "browser" is a reserved slug so these group together on the Agent tab.
+ */
+app.post("/api/agent/sessions", (req, res) => {
+  const title = typeof req.body?.title === "string" && req.body.title.trim() ? req.body.title.trim() : "";
+  try {
+    const { session } = resolveChannelSession({
+      channelSlug: "browser",
+      key: nanoid(8),
+      title: title || `Chat ${new Date().toISOString().slice(0, 16).replace("T", " ")}`,
+      executor: EXECUTOR_KIND,
+    });
+    res.json(toApi(session));
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
 });
 
 // --- the agent's home directory ---
@@ -452,6 +481,8 @@ app.use("/api", channelsRouter());
 app.use("/api", routinesRouter());
 app.use("/api", skillsRouter());
 app.use("/api", filesRouter());
+app.use("/api", mcpRouter());
+app.use("/api", peopleRouter());
 
 // --- event stream ---
 
@@ -517,8 +548,14 @@ if (existsSync(webDist)) {
   app.get(/^(?!\/api).*/, (_req, res) => res.sendFile(path.join(webDist, "index.html")));
 }
 
+// On PATH via the image, but a volume that predates it has no such directory —
+// docker only seeds a volume that is empty, so an existing deploy would carry a
+// PATH entry pointing at nothing.
+mkdirSync(BIN_DIR, { recursive: true });
+
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`pithagoras listening on :${PORT}`);
+  console.log(`  local bin: ${BIN_DIR}`);
   console.log(`  executor: ${EXECUTOR_KIND}`);
   console.log(`  workspaces: ${WORKSPACE_ROOT}`);
   console.log(`  auth:     ${authEnabled ? "password" : "DISABLED"}`);

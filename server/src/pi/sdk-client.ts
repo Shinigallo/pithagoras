@@ -5,6 +5,9 @@ import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import type { PiClient, PiCommand, PiState, PiStats } from "./types.js";
 import { routineTools } from "./routine-tools.js";
+import { reportTool, reportToFor } from "./report-tool.js";
+import { guardExtension } from "./guard.js";
+import { askPrimaryTool } from "./ask-primary.js";
 
 function asArray(v: any): any[] {
   const resolved = typeof v === "function" ? v() : v;
@@ -18,11 +21,24 @@ function asArray(v: any): any[] {
  * agent's home directory gets its character, its user and its memory without
  * anything being generated.
  */
+/**
+ * The agent's own files, and who is allowed to see them.
+ *
+ * SOUL.md is who the agent is and travels everywhere. PrimaryUser.md and
+ * MEMORY.md are one person's notes about themselves and their work, so a
+ * conversation with anyone else must not load them — otherwise a teammate
+ * messaging the bot gets an agent carrying your private context.
+ *
+ * TEAM.md is the shared half: what everyone may be told.
+ */
 const CONTEXT_FILES = ["SOUL.md", "PrimaryUser.md", "MEMORY.md"];
+const SHARED_FILES = ["SOUL.md", "TEAM.md"];
 
-function extraContextFiles(cwd: string): { path: string; content: string }[] {
+const filesFor = (role?: string) => (!role || role === "primary" ? CONTEXT_FILES : SHARED_FILES);
+
+function extraContextFiles(cwd: string, role?: string): { path: string; content: string }[] {
   const out: { path: string; content: string }[] = [];
-  for (const name of CONTEXT_FILES) {
+  for (const name of filesFor(role)) {
     const file = path.join(cwd, name);
     try {
       if (existsSync(file)) out.push({ path: file, content: readFileSync(file, "utf8") });
@@ -41,8 +57,8 @@ function extraContextFiles(cwd: string): { path: string; content: string }[] {
  * material, and the model read its own identity as notes about a third party.
  * One line at system level is enough to change what they are.
  */
-function framing(cwd: string): string[] {
-  const present = CONTEXT_FILES.filter((name) => {
+function framing(cwd: string, role?: string): string[] {
+  const present = filesFor(role).filter((name) => {
     try {
       return existsSync(path.join(cwd, name));
     } catch {
@@ -119,6 +135,17 @@ export class SdkPiClient extends EventEmitter implements PiClient {
      * through a channel should be able to touch the schedule.
      */
     routineTools?: boolean;
+    /**
+     * The routine this session runs, when it is one. Gives the agent the report
+     * tool, so a run with nobody watching can still reach someone.
+     */
+    routineSlug?: string | null;
+    /** Whoever is speaking right now — read at each tool call. */
+    whoNow?: () => { role: string; key?: string };
+    /** Lowest role this conversation serves, deciding which context files load. */
+    role?: string;
+    /** The portal's session id, for tools that record against it. */
+    sessionId?: string;
   }): Promise<SdkPiClient> {
     // Imported lazily so the server still boots (and the container executor
     // still works) if the SDK cannot initialise in this environment.
@@ -134,6 +161,23 @@ export class SdkPiClient extends EventEmitter implements PiClient {
       // Both are required: the constructor resolves each and throws on
       // undefined, which previously left every session with no extensions.
       const builtinSkills = builtinSkillsDir();
+      // Every session, unconditionally: the point is to limit what a turn can do
+      // after it reads something untrusted, and any session can read something.
+      const factories: { name: string; factory: (pi: any) => void }[] = [
+        { name: "guard", factory: guardExtension(opts.sessionDir, opts.whoNow ?? (() => ({ role: "primary" })), opts.sessionId) },
+      ];
+      if (opts.routineTools)
+        factories.push({ name: "routines", factory: routineTools(opts.sessionId) });
+      // Only where it means something: a conversation with the primary user has
+      // nobody to escalate to, and the tool would just be noise.
+      if (opts.sessionId && opts.role && opts.role !== "primary") {
+        factories.push({ name: "ask-primary", factory: askPrimaryTool(opts.sessionId) });
+      }
+      // Only when there is somewhere for it to go — a tool that always fails is
+      // worse than no tool, and the model will keep trying it.
+      if (opts.routineSlug !== undefined && reportToFor(opts.routineSlug)) {
+        factories.push({ name: "report", factory: reportTool(opts.routineSlug ?? null) });
+      }
       resourceLoader = new pi.DefaultResourceLoader({
         cwd: opts.cwd,
         agentDir: pi.getAgentDir(),
@@ -144,23 +188,23 @@ export class SdkPiClient extends EventEmitter implements PiClient {
         // Inline rather than an installed package: the portal owns routines, so
         // a package would have to call back over HTTP to reach the database it
         // sits beside. Absent unless asked, so a task session never sees them.
-        ...(opts.routineTools
-          ? { extensionFactories: [{ name: "routines", factory: routineTools }] }
-          : {}),
+        // Registered only where each belongs: routine management for sessions
+        // reached through a channel, reporting for routine runs.
+        ...(factories.length ? { extensionFactories: factories } : {}),
         // pi discovers one context file per directory — AGENTS.md or CLAUDE.md
         // — so the agent's own files would be invisible to it. Rather than
         // generating an AGENTS.md from them and keeping it in sync, they are
         // handed to pi as context files directly. Nothing to regenerate, and an
         // edit is live for the next session that starts.
         agentsFilesOverride: (base: { agentsFiles: any[] }) => ({
-          agentsFiles: [...base.agentsFiles, ...extraContextFiles(opts.cwd)],
+          agentsFiles: [...base.agentsFiles, ...extraContextFiles(opts.cwd, opts.role)],
         }),
         // Content alone is not enough. Handed over as plain context files, pi
         // presents them as reference material and the model answers "who are
         // you" from its own base identity — verified: it read a fact out of
         // MEMORY.md correctly while insisting it was Pi, made by Baidu. This
         // says what the files are for.
-        appendSystemPrompt: framing(opts.cwd),
+        appendSystemPrompt: framing(opts.cwd, opts.role),
       });
       await resourceLoader.reload();
     } catch (e) {

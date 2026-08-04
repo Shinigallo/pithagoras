@@ -42,6 +42,12 @@ export interface SessionRow {
    * channel — and the prefix keeps two channels using the same key apart.
    */
   channel_key: string | null;
+  /** Routine sessions only: the slug of the routine that owns this session. */
+  routine_slug: string | null;
+  /** Lowest role this conversation has served — see the migration for why. */
+  role: "primary" | "colleague" | "guest" | "unknown";
+  /** Who last spoke here, surviving a restart that empties the in-memory map. */
+  last_person_key: string | null;
 }
 
 export interface EventRow {
@@ -136,6 +142,13 @@ export function getDb(): Database.Database {
       instructions TEXT NOT NULL DEFAULT '',
       -- Start each run in a clean session instead of the routine's own.
       fresh_session INTEGER NOT NULL DEFAULT 0,
+      -- Where a run's report goes. NULL inherits the portal default; '' means
+      -- this routine never reports, whatever the default is.
+      report_channel TEXT,
+      report_target TEXT,
+      -- When a run last reached a person. Distinguishes "nothing to say" from
+      -- "wrote it out and never sent it", which look identical otherwise.
+      last_report_at TEXT,
       last_run TEXT,
       last_status TEXT,
       last_output TEXT,
@@ -147,6 +160,84 @@ export function getDb(): Database.Database {
 
     -- Portal-wide defaults applied to every new session. Env vars are the
     -- fallback, so an untouched install still works out of the box.
+    -- Who the agent talks to. Identified by the platform's own stable id,
+    -- scoped by channel, because a display name is chosen by whoever types it.
+    CREATE TABLE IF NOT EXISTS people (
+      key TEXT PRIMARY KEY,
+      name TEXT NOT NULL DEFAULT '',
+      -- primary | colleague | guest | unknown
+      role TEXT NOT NULL DEFAULT 'unknown',
+      notes TEXT NOT NULL DEFAULT '',
+      first_seen TEXT NOT NULL DEFAULT (datetime('now')),
+      last_seen TEXT,
+      announced_at TEXT
+    );
+
+    -- Questions a colleague's session could not answer, waiting on the primary
+    -- user. The id is short because a human types it back in a chat.
+    CREATE TABLE IF NOT EXISTS questions (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      person_key TEXT NOT NULL,
+      person_name TEXT NOT NULL DEFAULT '',
+      channel_slug TEXT NOT NULL,
+      channel_key TEXT NOT NULL,
+      question TEXT NOT NULL,
+      asked_at TEXT NOT NULL DEFAULT (datetime('now')),
+      answered_at TEXT,
+      answer TEXT,
+      -- The exact thing the agent wants to do, when it is asking for permission
+      -- rather than an opinion. Approving grants this and nothing else.
+      action_tool TEXT,
+      action TEXT
+    );
+
+    -- A permission granted once, for one exact action, in one conversation.
+    -- Not a role change: it expires, it is used up, and it authorises the thing
+    -- that was shown to the person who approved it.
+    CREATE TABLE IF NOT EXISTS grants (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      tool TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      expires_at TEXT NOT NULL,
+      used_at TEXT
+    );
+
+    -- Things the portal said into a conversation while nobody was talking to
+    -- it: a routine's report, an answer relayed back. Held until that
+    -- conversation next runs, then folded into its context — otherwise the
+    -- agent is asked "why did you say that?" about a message it never saw.
+    CREATE TABLE IF NOT EXISTS notes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      text TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      consumed_at TEXT,
+      -- 1 when the person has not seen this yet: the channel could not be
+      -- spoken to, so it waits and goes out with the next reply.
+      pending_delivery INTEGER NOT NULL DEFAULT 0
+    );
+
+    -- Exceptions to what a non-primary role may run. Without these the only
+    -- choice is read-only or full trust, and the useful middle — "colleagues may
+    -- list my inbox, nothing else" — has nowhere to live.
+    CREATE TABLE IF NOT EXISTS tool_rules (
+      id TEXT PRIMARY KEY,
+      -- colleague | guest | all (both)
+      role TEXT NOT NULL,
+      tool TEXT NOT NULL,
+      -- Glob against the command for bash, the path for file tools.
+      pattern TEXT NOT NULL,
+      -- One person, when the rule came from approving their request. NULL
+      -- applies to everyone holding the role, which is a much bigger thing to
+      -- say and should only happen deliberately.
+      person_key TEXT,
+      note TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
@@ -177,6 +268,15 @@ function migrate(d: Database.Database): void {
   }
   if (!names.includes("pi_session_file")) {
     d.exec("ALTER TABLE sessions ADD COLUMN pi_session_file TEXT");
+  }
+  // The lowest role this session has ever served. Ratchets down and never up:
+  // once a guest has spoken in a conversation, the private context files stay
+  // out of it even if the next message is from the primary user.
+  if (!names.includes("last_person_key")) {
+    d.exec("ALTER TABLE sessions ADD COLUMN last_person_key TEXT");
+  }
+  if (!names.includes("role")) {
+    d.exec("ALTER TABLE sessions ADD COLUMN role TEXT NOT NULL DEFAULT 'primary'");
   }
 
   if (!names.includes("kind")) {
@@ -222,7 +322,34 @@ function migrate(d: Database.Database): void {
   if (routineCols.length && !routineCols.includes("run_at")) {
     d.exec("ALTER TABLE routines ADD COLUMN run_at TEXT");
   }
+  for (const col of ["report_channel", "report_target", "last_report_at"]) {
+    if (routineCols.length && !routineCols.includes(col)) {
+      d.exec(`ALTER TABLE routines ADD COLUMN ${col} TEXT`);
+    }
+  }
   d.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_routines_slug ON routines(slug)");
+  d.exec("CREATE INDEX IF NOT EXISTS idx_notes_pending ON notes(session_id, consumed_at)");
+  d.exec("CREATE INDEX IF NOT EXISTS idx_grants_open ON grants(session_id, tool, used_at)");
+  const ruleCols = (d.prepare("PRAGMA table_info(tool_rules)").all() as { name: string }[]).map(
+    (c) => c.name
+  );
+  if (ruleCols.length && !ruleCols.includes("person_key")) {
+    d.exec("ALTER TABLE tool_rules ADD COLUMN person_key TEXT");
+  }
+  const questionCols = (d.prepare("PRAGMA table_info(questions)").all() as { name: string }[]).map(
+    (c) => c.name
+  );
+  for (const col of ["action_tool", "action"]) {
+    if (questionCols.length && !questionCols.includes(col)) {
+      d.exec(`ALTER TABLE questions ADD COLUMN ${col} TEXT`);
+    }
+  }
+  const noteCols = (d.prepare("PRAGMA table_info(notes)").all() as { name: string }[]).map(
+    (c) => c.name
+  );
+  if (noteCols.length && !noteCols.includes("pending_delivery")) {
+    d.exec("ALTER TABLE notes ADD COLUMN pending_delivery INTEGER NOT NULL DEFAULT 0");
+  }
 }
 
 export function createSession(row: {
@@ -429,4 +556,119 @@ export function setSettings(patch: Partial<GlobalSettings>): GlobalSettings {
     else clear.run(k);
   }
   return getSettings();
+}
+
+/** Where reports go when a routine does not name a destination of its own. */
+export interface ReportTo {
+  channel: string;
+  target: string;
+}
+
+export function getDefaultReportTo(): ReportTo | null {
+  const stored = getStoredSettings() as Record<string, string>;
+  const channel = stored.report_channel;
+  const target = stored.report_target;
+  return channel && target ? { channel, target } : null;
+}
+
+export function setDefaultReportTo(to: ReportTo | null): void {
+  const upsert = getDb().prepare(
+    "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+  );
+  const clear = getDb().prepare("DELETE FROM settings WHERE key = ?");
+  if (!to) {
+    clear.run("report_channel");
+    clear.run("report_target");
+    return;
+  }
+  upsert.run("report_channel", to.channel);
+  upsert.run("report_target", to.target);
+}
+
+/** Something the portal said into a conversation, waiting to join its context. */
+export function addNote(sessionId: string, text: string, pendingDelivery = false): void {
+  getDb()
+    .prepare("INSERT INTO notes (session_id, text, pending_delivery) VALUES (?, ?, ?)")
+    .run(sessionId, text, pendingDelivery ? 1 : 0);
+}
+
+/**
+ * Messages the person has not seen, because their channel cannot be spoken to.
+ *
+ * Reading them hands over responsibility for delivering them, so they are only
+ * taken at the point they are about to go out with a reply.
+ */
+export function takeDeliveries(sessionId: string): string[] {
+  const rows = getDb()
+    .prepare("SELECT id, text FROM notes WHERE session_id = ? AND pending_delivery = 1 ORDER BY id ASC")
+    .all(sessionId) as { id: number; text: string }[];
+  const mark = getDb().prepare("UPDATE notes SET pending_delivery = 0 WHERE id = ?");
+  for (const r of rows) mark.run(r.id);
+  return rows.map((r) => r.text);
+}
+
+/** Take the pending notes for a conversation. Reading them consumes them. */
+export function takeNotes(sessionId: string): string[] {
+  const rows = getDb()
+    .prepare("SELECT id, text FROM notes WHERE session_id = ? AND consumed_at IS NULL ORDER BY id ASC")
+    .all(sessionId) as { id: number; text: string }[];
+  if (!rows.length) return [];
+  const mark = getDb().prepare("UPDATE notes SET consumed_at = datetime('now') WHERE id = ?");
+  for (const r of rows) mark.run(r.id);
+  return rows.map((r) => r.text);
+}
+
+export interface ToolRule {
+  id: string;
+  role: string;
+  tool: string;
+  pattern: string;
+  /** Null applies to the whole role; set narrows it to one person. */
+  person_key: string | null;
+  note: string;
+  created_at: string;
+}
+
+export const listToolRules = (): ToolRule[] =>
+  getDb().prepare("SELECT * FROM tool_rules ORDER BY tool, pattern").all() as ToolRule[];
+
+export function addToolRule(rule: Omit<ToolRule, "created_at" | "person_key"> & { person_key?: string | null }): void {
+  getDb()
+    .prepare(
+      "INSERT INTO tool_rules (id, role, tool, pattern, note, person_key) VALUES (?, ?, ?, ?, ?, ?)"
+    )
+    .run(rule.id, rule.role, rule.tool, rule.pattern, rule.note, rule.person_key ?? null);
+}
+
+export const deleteToolRule = (id: string): void => {
+  getDb().prepare("DELETE FROM tool_rules WHERE id = ?").run(id);
+};
+
+/** How long an approval stays good. Long enough to act on, short enough to forget. */
+const GRANT_MINUTES = 15;
+
+export function addGrant(id: string, sessionId: string, tool: string, subject: string): void {
+  getDb()
+    .prepare("INSERT INTO grants (id, session_id, tool, subject, expires_at) VALUES (?, ?, ?, ?, ?)")
+    .run(id, sessionId, tool, subject, new Date(Date.now() + GRANT_MINUTES * 60_000).toISOString());
+}
+
+/**
+ * Spend a matching approval, if one is open.
+ *
+ * Matched on the exact subject that was shown to whoever approved it: they said
+ * yes to a command they read, so a different command is a different question.
+ * Marked used in the same breath, because an approval is for one act.
+ */
+export function useGrant(sessionId: string, tool: string, subject: string): boolean {
+  const row = getDb()
+    .prepare(
+      `SELECT id FROM grants
+       WHERE session_id = ? AND tool = ? AND subject = ? AND used_at IS NULL AND expires_at > ?
+       ORDER BY created_at ASC LIMIT 1`
+    )
+    .get(sessionId, tool, subject, new Date().toISOString()) as { id: string } | undefined;
+  if (!row) return false;
+  getDb().prepare("UPDATE grants SET used_at = ? WHERE id = ?").run(new Date().toISOString(), row.id);
+  return true;
 }

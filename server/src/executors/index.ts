@@ -17,6 +17,12 @@ export interface LaunchOptions {
   sessionFile?: string;
   /** Give this session the routine tools. Channel sessions only. */
   routineTools?: boolean;
+  /** The routine being run, when this is a routine session. Enables reporting. */
+  routineSlug?: string | null;
+  /** Lowest role the conversation serves; decides which context files load. */
+  role?: string;
+  /** Whoever is speaking, read at each tool call. */
+  whoNow?: () => { role: string; key?: string };
 }
 
 export interface Executor {
@@ -60,6 +66,10 @@ export class HostExecutor implements Executor {
       sessionDir: path.join(this.sessionRoot, opts.sessionId),
       sessionFile: opts.sessionFile,
       routineTools: opts.routineTools,
+      routineSlug: opts.routineSlug,
+      role: opts.role,
+      sessionId: opts.sessionId,
+      whoNow: opts.whoNow,
       provider: opts.provider,
       modelId: opts.model,
       thinkingLevel: opts.thinkingLevel,

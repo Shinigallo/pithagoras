@@ -76,6 +76,11 @@ export interface Routine {
   done: boolean;
   instructions: string;
   freshSession: boolean;
+  /** null inherits the portal default; "" means this one never reports. */
+  reportChannel: string | null;
+  reportTarget: string | null;
+  /** When a run last reached a person through the report tool. */
+  lastReportAt: string | null;
   lastRun: string | null;
   lastStatus: string | null;
   lastOutput: string | null;
@@ -160,6 +165,27 @@ export const api = {
       body: JSON.stringify({ id, ...payload }),
     }),
 
+  mcp: () => json<McpConfigView>("/api/mcp"),
+  saveMcpServer: (name: string, entry: McpServerEntry, from?: string) =>
+    json<{ ok: true }>(`/api/mcp/servers/${encodeURIComponent(name)}`, {
+      method: "PUT",
+      body: JSON.stringify({ entry, from }),
+    }),
+  deleteMcpServer: (name: string) =>
+    json<{ ok: true }>(`/api/mcp/servers/${encodeURIComponent(name)}`, { method: "DELETE" }),
+  saveMcpSettings: (settings: Record<string, unknown>) =>
+    json<{ ok: true }>("/api/mcp/settings", {
+      method: "PUT",
+      body: JSON.stringify({ settings }),
+    }),
+  importMcp: (text: string) =>
+    json<{ ok: true; added: string[]; skipped: { name: string; reason: string }[] }>(
+      "/api/mcp/import",
+      { method: "POST", body: JSON.stringify({ text }) }
+    ),
+  saveMcpRaw: (content: string) =>
+    json<{ ok: true }>("/api/mcp/raw", { method: "PUT", body: JSON.stringify({ content }) }),
+
   skills: () =>
     json<{ root: string; skills: Skill[]; diagnostics: SkillDiagnostic[] }>("/api/skills"),
   previewSkillImport: (spec: string) =>
@@ -195,12 +221,45 @@ export const api = {
   deleteSkill: (name: string) =>
     json<{ ok: true }>(`/api/skills/${encodeURIComponent(name)}`, { method: "DELETE" }),
 
+  people: () => json<{ people: Person[] }>("/api/people"),
+  toolRules: () => json<{ rules: ToolRule[] }>("/api/tool-rules"),
+  addToolRule: (rule: {
+    role: string;
+    tool: string;
+    pattern: string;
+    note?: string;
+    /** Narrows the rule to one person; omitted, it applies to the whole role. */
+    personKey?: string;
+  }) =>
+    json<{ rules: ToolRule[] }>("/api/tool-rules", {
+      method: "POST",
+      body: JSON.stringify(rule),
+    }),
+  deleteToolRule: (id: string) =>
+    json<{ rules: ToolRule[] }>(`/api/tool-rules/${id}`, { method: "DELETE" }),
+  updatePerson: (key: string, patch: { name?: string; role?: Role; notes?: string }) =>
+    json<{ person: Person }>(`/api/people/${encodeURIComponent(key)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  forgetPerson: (key: string) =>
+    json<{ ok: true }>(`/api/people/${encodeURIComponent(key)}`, { method: "DELETE" }),
+
   routines: () => json<{ routines: Routine[] }>("/api/routines"),
+  reportTargets: () =>
+    json<{ targets: ReportTarget[]; default: ReportTo | null }>("/api/routines/report-targets"),
+  setReportDefault: (to: ReportTo | null) =>
+    json<{ default: ReportTo | null }>("/api/routines/report-default", {
+      method: "PUT",
+      body: JSON.stringify(to ?? {}),
+    }),
   createRoutine: (input: {
     name: string;
     schedule?: string;
     runAt?: string;
     instructions?: string;
+    reportChannel?: string | null;
+    reportTarget?: string | null;
   }) =>
     json<Routine>("/api/routines", { method: "POST", body: JSON.stringify(input) }),
   updateRoutine: (
@@ -213,6 +272,8 @@ export const api = {
       instructions?: string;
       enabled?: boolean;
       freshSession?: boolean;
+      reportChannel?: string | null;
+      reportTarget?: string | null;
     }
   ) => json<Routine>(`/api/routines/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
   deleteRoutine: (id: string) => json<{ ok: true }>(`/api/routines/${id}`, { method: "DELETE" }),
@@ -238,6 +299,11 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ content }),
     }),
+
+  /** Any session by id, including agent and routine ones the task list omits. */
+  session: (id: string) => json<Session>(`/api/sessions/${id}`),
+  startAgentChat: (title?: string) =>
+    json<Session>("/api/agent/sessions", { method: "POST", body: JSON.stringify({ title }) }),
 
   agentSessions: () =>
     json<{ sessions: AgentSession[]; agentHome: string }>("/api/agent/sessions"),
@@ -504,4 +570,85 @@ export interface PiCommand {
   /** Builtins only: "client" commands are handled here, not sent to pi. */
   where?: "server" | "client";
   sourceInfo?: { path?: string; scope?: string; origin?: string };
+}
+
+/** One MCP server as pi-mcp-adapter reads it. Unlisted keys are kept verbatim. */
+export interface McpServerEntry {
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  cwd?: string;
+  url?: string;
+  headers?: Record<string, string>;
+  socket?: string;
+  auth?: "oauth" | "bearer" | false;
+  bearerToken?: string;
+  bearerTokenEnv?: string;
+  lifecycle?: "lazy" | "eager" | "keep-alive" | "lazy-keep-alive";
+  idleTimeout?: number;
+  requestTimeoutMs?: number;
+  exposeResources?: boolean;
+  directTools?: boolean | string[];
+  includeTools?: string[];
+  excludeTools?: string[];
+  debug?: boolean;
+  disabled?: boolean;
+  [key: string]: unknown;
+}
+
+export interface McpServerView {
+  name: string;
+  entry: McpServerEntry;
+  transport: "stdio" | "http" | "socket" | "unknown";
+  disabled: boolean;
+}
+
+export interface McpConfigView {
+  path: string;
+  exists: boolean;
+  /** Without the adapter installed, nothing here is read by anything. */
+  adapterInstalled: boolean;
+  adapterSpec: string;
+  servers: McpServerView[];
+  settings: Record<string, unknown>;
+  raw: string;
+  parseError: string | null;
+}
+
+/** A conversation a routine can report into. */
+export interface ReportTarget {
+  channel: string;
+  target: string;
+  label: string;
+}
+
+export interface ReportTo {
+  channel: string;
+  target: string;
+}
+
+/** Descending capability. "unknown" never reaches the agent at all. */
+export type Role = "primary" | "colleague" | "guest" | "unknown";
+
+export interface Person {
+  key: string;
+  name: string;
+  role: Role;
+  notes: string;
+  first_seen: string;
+  last_seen: string | null;
+  announced_at: string | null;
+}
+
+/** An exception to what a non-primary role may run. */
+export interface ToolRule {
+  id: string;
+  role: string;
+  tool: string;
+  pattern: string;
+  /** Set when the rule is for one person rather than a whole role. */
+  person_key: string | null;
+  person_name: string | null;
+  note: string;
+  created_at: string;
 }
