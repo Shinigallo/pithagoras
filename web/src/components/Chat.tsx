@@ -3,6 +3,7 @@ import ReactMarkdown from "react-markdown";
 import { api, type PiCommand, type PortalEvent, type Session } from "../api";
 import { buildTranscript } from "../transcript";
 import { ComposerBar } from "./ComposerBar";
+import { FilesPanel } from "./FilesPanel";
 
 /**
  * Context the portal attaches to a message, and what to call it.
@@ -81,9 +82,11 @@ export function Chat({
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [panelRequest, setPanelRequest] = useState<"model" | "effort" | null>(null);
+  const [showFiles, setShowFiles] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const items = useMemo(() => buildTranscript(events), [events]);
   const running = session.status === "running";
+  const workspaceName = (session.workspace ?? "").split("/").pop() ?? "";
 
   // Commands come from pi at runtime, so anything a newly installed package
   // registers shows up here without the portal knowing about it in advance.
@@ -134,6 +137,8 @@ export function Chat({
   };
 
   return (
+    <div className="flex h-full flex-row">
+      <div className="flex flex-col flex-1">
     <div className="flex h-full flex-col">
       <header className="border-b border-line px-4 py-3">
         <div className="mx-auto flex w-full max-w-3xl items-center gap-3">
@@ -155,6 +160,12 @@ export function Chat({
               Stop
             </button>
           )}
+          <button
+            onClick={() => setShowFiles(!showFiles)}
+            className="rounded-lg border border-line px-2.5 py-1 text-xs text-fg-muted transition hover:bg-fg/5 hover:text-fg"
+          >
+            Files
+          </button>
         </div>
         </div>
       </header>
@@ -311,6 +322,9 @@ export function Chat({
           />
         </div>
       </form>
+    </div>
+      </div>
+      {showFiles && <FilesPanel workspace={workspaceName} />}
     </div>
   );
 }

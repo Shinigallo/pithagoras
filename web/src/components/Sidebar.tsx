@@ -3,7 +3,7 @@ import { ThemeSwitcher } from "./ThemeSwitcher";
 import {
   LuBot,
   LuClock,
-  LuFolder,
+
   LuMessagesSquare,
   LuPin,
   LuPinOff,
@@ -65,7 +65,7 @@ export function Sidebar({
   executor: string;
   activeId: string | null;
   /** Which top-level destination is showing, so the nav can mark it. */
-  view: "chat" | "sessions" | "agent" | "routines" | "files";
+  view: "chat" | "sessions" | "agent" | "routines";
   onSelect: (id: string) => void;
   onCreate: (workspacePath: string) => Promise<void>;
   onDelete: (id: string) => Promise<void>;
@@ -73,7 +73,7 @@ export function Sidebar({
   onPin: (id: string, pinned: boolean) => Promise<void>;
   onCreateWorkspace: (name: string) => Promise<Workspace>;
   onOpenSettings: () => void;
-  onNavigate: (to: "sessions" | "agent" | "routines" | "files") => void;
+  onNavigate: (to: "sessions" | "agent" | "routines") => void;
 }) {
   const [creating, setCreating] = useState(false);
   const [choice, setChoice] = useState<string>(NEW);
@@ -158,12 +158,6 @@ export function Sidebar({
           label="Routines"
           onClick={() => onNavigate("routines")}
           active={view === "routines"}
-        />
-        <NavItem
-          icon={<LuFolder />}
-          label="Files"
-          onClick={() => onNavigate("files")}
-          active={view === "files"}
         />
 
         {creating && (
