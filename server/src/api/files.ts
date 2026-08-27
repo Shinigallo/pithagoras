@@ -1,5 +1,13 @@
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import path from "node:path";
 import express, { type Router } from "express";
 
@@ -10,9 +18,15 @@ import express, { type Router } from "express";
  * just gives the browser the same view, scoped to one workspace and with path
  * traversal blocked, rather than requiring an SSH session or the host shell to
  * see what the agent produced.
+ *
+ * Lexical checks (`..`, absolute overrides) alone don't stop a symlink inside
+ * a workspace from pointing outside it — `path.resolve` never looks at the
+ * filesystem, so `<workspace>/escape -> /etc` would sail through them. Every
+ * boundary check below also canonicalizes with `realpath` and re-checks the
+ * resolved target against the canonical root.
  */
 
-const WORKSPACE_ROOT = path.resolve(process.env.WORKSPACE_ROOT || "/workspaces");
+const WORKSPACE_ROOT = canonicalize(path.resolve(process.env.WORKSPACE_ROOT || "/workspaces"));
 
 /** Excluded from "download whole workspace" — regenerable or huge, not the work itself. */
 const ARCHIVE_EXCLUDES = ["node_modules", ".git", "__pycache__", ".venv", "venv", "dist", "build"];
@@ -20,24 +34,68 @@ const ARCHIVE_EXCLUDES = ["node_modules", ".git", "__pycache__", ".venv", "venv"
 /** Above this, a file is offered as a download only — not decoded into a JSON body. */
 const MAX_EDIT_BYTES = 2 * 1024 * 1024;
 
-/** The workspace's absolute directory, or throws for a name that isn't one. */
-function workspaceDir(name: string): string {
-  const dir = path.join(WORKSPACE_ROOT, name);
-  if (path.resolve(dir) !== dir || !dir.startsWith(WORKSPACE_ROOT + path.sep)) {
-    throw new Error("Invalid workspace name");
+/** realpath(p), or p itself if it doesn't exist yet (e.g. at process startup). */
+function canonicalize(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
   }
-  if (!existsSync(dir)) throw new Error(`Workspace "${name}" not found`);
-  return dir;
 }
 
 /**
- * A path within a workspace, rejecting anything that escapes it via `..` or
- * an absolute override — the query string is client-controlled.
+ * realpath of `target`, resolving symlinks in whichever leading portion of it
+ * already exists. `target` itself may not exist yet — a PUT creating a new
+ * file resolves through its (existing) parent directory instead, per CWE-59
+ * guidance: canonicalize the existing ancestor, keep the not-yet-created tail
+ * literal.
+ */
+function realpathThroughExistingAncestor(target: string): string {
+  let current = target;
+  const missingTail: string[] = [];
+  while (!existsSync(current)) {
+    const parent = path.dirname(current);
+    if (parent === current) break; // reached the filesystem root without finding anything
+    missingTail.unshift(path.basename(current));
+    current = parent;
+  }
+  const real = realpathSync(current);
+  return missingTail.length ? path.join(real, ...missingTail) : real;
+}
+
+/** True when `p` is `root` or lexically nested inside it. */
+function isWithin(root: string, p: string): boolean {
+  return p === root || p.startsWith(root + path.sep);
+}
+
+/** The workspace's absolute, canonical directory, or throws for a name that isn't one. */
+function workspaceDir(name: string): string {
+  const dir = path.join(WORKSPACE_ROOT, name);
+  if (path.resolve(dir) !== dir || !isWithin(WORKSPACE_ROOT, dir)) {
+    throw new Error("Invalid workspace name");
+  }
+  if (!existsSync(dir)) throw new Error(`Workspace "${name}" not found`);
+  const real = realpathSync(dir);
+  if (!isWithin(WORKSPACE_ROOT, real)) {
+    // The workspace entry itself is a symlink pointing outside the root —
+    // treat it the same as a workspace that doesn't exist.
+    throw new Error(`Workspace "${name}" not found`);
+  }
+  return real;
+}
+
+/**
+ * A path within a workspace, rejecting anything that escapes it via `..`, an
+ * absolute override, or a symlink resolving outside — `base` must already be
+ * canonical (as returned by workspaceDir).
  */
 function resolveSafe(base: string, relPath: string): string {
   const rel = String(relPath ?? "").replace(/^[/\\]+/, "");
   const resolved = path.resolve(base, rel);
-  if (resolved !== base && !resolved.startsWith(base + path.sep)) {
+  if (!isWithin(base, resolved)) {
+    throw new Error("Path escapes the workspace");
+  }
+  if (!isWithin(base, realpathThroughExistingAncestor(resolved))) {
     throw new Error("Path escapes the workspace");
   }
   return resolved;
