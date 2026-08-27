@@ -8,6 +8,7 @@ import {
   LuRefreshCw,
   LuSave,
   LuTrash2,
+  LuX,
 } from "react-icons/lu";
 import { api, type FileEntry } from "../api";
 
@@ -58,6 +59,7 @@ export function FilesPanel({ workspace }: { workspace: string }) {
   }, [workspace, dirPath]);
 
   const openEntry = (name: string) => {
+    if (dirty && !confirm("Discard unsaved changes?")) return;
     const rel = dirPath ? `${dirPath}/${name}` : name;
     setOpenFile(rel);
     setFileError(null);
@@ -69,6 +71,12 @@ export function FilesPanel({ workspace }: { workspace: string }) {
         setContent(r.content ?? "");
       })
       .catch((e) => setFileError((e as Error).message));
+  };
+
+  const closeFile = () => {
+    if (dirty && !confirm("Discard unsaved changes?")) return;
+    setOpenFile(null);
+    setFileError(null);
   };
 
   const save = async () => {
@@ -101,9 +109,19 @@ export function FilesPanel({ workspace }: { workspace: string }) {
   };
 
   const crumbs = dirPath ? dirPath.split("/") : [];
+  const openFileName = openFile?.split("/").pop() ?? "";
 
   return (
-    <div className="flex h-full w-80 shrink-0 flex-col border-l border-line">
+    <div
+      className={`flex h-full shrink-0 border-l border-line ${
+        openFile ? "w-[44rem]" : "w-80"
+      }`}
+    >
+      <div
+        className={`flex h-full flex-col ${
+          openFile ? "w-72 shrink-0 border-r border-line" : "w-full"
+        }`}
+      >
       <div className="shrink-0 border-b border-line px-3 py-2.5">
         <div className="flex items-center gap-2">
           <span className="min-w-0 truncate text-xs text-fg-subtle">{workspace}</span>
@@ -188,6 +206,61 @@ export function FilesPanel({ workspace }: { workspace: string }) {
           );
         })}
       </div>
+      </div>
+
+      {openFile && (
+        <div className="flex h-full min-w-0 flex-1 flex-col">
+          <div className="flex shrink-0 items-center gap-2 border-b border-line px-3 py-2.5">
+            <LuFileText className="h-3.5 w-3.5 shrink-0 text-fg-faint" />
+            <span className="min-w-0 flex-1 truncate text-xs text-fg-subtle" title={openFile}>
+              {openFileName}
+              {dirty && <span className="ml-1 text-accent">•</span>}
+            </span>
+            <a
+              className={btnCls}
+              href={api.fileDownloadUrl(workspace, openFile)}
+              title="Download this file"
+            >
+              <LuDownload className="h-3.5 w-3.5" />
+            </a>
+            {!binary && (
+              <button onClick={save} disabled={!dirty || saving} className={primaryCls} title="Save">
+                <LuSave className="h-3.5 w-3.5" />
+                <span>{saving ? "Saving…" : "Save"}</span>
+              </button>
+            )}
+            <button
+              onClick={closeFile}
+              title="Close"
+              className="shrink-0 rounded p-1 text-fg-faint transition hover:bg-fg/10 hover:text-fg"
+            >
+              <LuX className="h-3.5 w-3.5" />
+            </button>
+          </div>
+
+          {fileError && (
+            <p className="m-2 flex items-start gap-1.5 rounded-lg border border-danger/25 bg-danger/10 px-2 py-2 text-xs text-danger">
+              <LuCircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" /> {fileError}
+            </p>
+          )}
+
+          {binary ? (
+            <div className="flex flex-1 items-center justify-center p-6 text-center text-xs text-fg-subtle">
+              Binary or large file — use Download to view it.
+            </div>
+          ) : (
+            <textarea
+              value={content}
+              onChange={(ev) => {
+                setContent(ev.target.value);
+                setDirty(true);
+              }}
+              spellCheck={false}
+              className="flex-1 resize-none bg-transparent p-3 font-mono text-xs text-fg outline-none"
+            />
+          )}
+        </div>
+      )}
     </div>
   );
 }
