@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   LuChevronRight,
   LuCircleAlert,
@@ -58,19 +58,29 @@ export function FilesPanel({ workspace }: { workspace: string }) {
     refreshList();
   }, [workspace, dirPath]);
 
+  const fileRequestId = useRef(0);
+
   const openEntry = (name: string) => {
     if (dirty && !confirm("Discard unsaved changes?")) return;
     const rel = dirPath ? `${dirPath}/${name}` : name;
+    const requestId = ++fileRequestId.current;
     setOpenFile(rel);
     setFileError(null);
     setDirty(false);
+    setBinary(false);
+    setContent("");
     api
       .readFile(workspace, rel)
       .then((r) => {
+        if (requestId !== fileRequestId.current) return;
         setBinary(r.binary);
         setContent(r.content ?? "");
       })
-      .catch((e) => setFileError((e as Error).message));
+      .catch((e) => {
+        if (requestId === fileRequestId.current) {
+          setFileError((e as Error).message);
+        }
+      });
   };
 
   const closeFile = () => {
