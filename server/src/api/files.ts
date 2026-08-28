@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import {
   existsSync,
+  lstatSync,
   readFileSync,
   readdirSync,
   realpathSync,
@@ -43,23 +44,47 @@ function canonicalize(p: string): string {
   }
 }
 
+/** True when a filesystem entry exists at `p`, including a dangling symlink. */
+function existsLexically(p: string): boolean {
+  try {
+    lstatSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * realpath of `target`, resolving symlinks in whichever leading portion of it
  * already exists. `target` itself may not exist yet — a PUT creating a new
  * file resolves through its (existing) parent directory instead, per CWE-59
  * guidance: canonicalize the existing ancestor, keep the not-yet-created tail
  * literal.
+ *
+ * The walk uses `lstatSync`, not `existsSync`: `existsSync` follows symlinks,
+ * so it reports `false` for a *dangling* symlink and the loop would treat the
+ * link's own name as an ordinary missing path component — reconstructing a
+ * workspace-relative-looking path that passes the boundary check while
+ * `writeFileSync` follows the link itself to wherever it actually points.
+ * `lstatSync` sees the link as an existing entry regardless of where (or
+ * whether) its target exists, so it stops the walk there and `realpathSync`
+ * below is what gets to decide: dangling links throw and are rejected.
  */
 function realpathThroughExistingAncestor(target: string): string {
   let current = target;
   const missingTail: string[] = [];
-  while (!existsSync(current)) {
+  while (!existsLexically(current)) {
     const parent = path.dirname(current);
-    if (parent === current) break; // reached the filesystem root without finding anything
+    if (parent === current) throw new Error("Path does not exist");
     missingTail.unshift(path.basename(current));
     current = parent;
   }
-  const real = realpathSync(current);
+  let real: string;
+  try {
+    real = realpathSync(current);
+  } catch {
+    throw new Error("Path escapes the workspace"); // dangling symlink
+  }
   return missingTail.length ? path.join(real, ...missingTail) : real;
 }
 
